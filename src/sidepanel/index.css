@@ -1,0 +1,208 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Light theme (default) — iOS/macOS Liquid Glass */
+  --bg: #f2f3f7;
+  --bg-gradient-1: rgba(0, 122, 255, 0.1);
+  --bg-gradient-2: rgba(88, 86, 214, 0.08);
+  --bg-elevated: rgba(255, 255, 255, 0.72);
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-bg-strong: rgba(255, 255, 255, 0.78);
+  --glass-border: rgba(255, 255, 255, 0.7);
+  --hairline: rgba(60, 60, 67, 0.14);
+
+  --text: #1c1c1e;
+  --text-muted: rgba(60, 60, 67, 0.6);
+  --text-faint: rgba(60, 60, 67, 0.4);
+
+  --accent: #007aff;
+  --accent-soft: rgba(0, 122, 255, 0.14);
+  --accent-glow: rgba(0, 122, 255, 0.45);
+
+  --kind-thought: #8e8e93;
+  --kind-action: #007aff;
+  --kind-observation: #34c759;
+  --kind-error: #ff3b30;
+  --kind-final: #30d158;
+
+  --amber: #ff9f0a;
+  --amber-soft: rgba(255, 159, 10, 0.14);
+
+  --shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --bg-gradient-1: rgba(10, 132, 255, 0.16);
+    --bg-gradient-2: rgba(94, 92, 230, 0.12);
+    --bg-elevated: rgba(28, 28, 30, 0.72);
+    --glass-bg: rgba(44, 44, 46, 0.55);
+    --glass-bg-strong: rgba(44, 44, 46, 0.82);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    --hairline: rgba(255, 255, 255, 0.1);
+
+    --text: #f5f5f7;
+    --text-muted: rgba(235, 235, 245, 0.6);
+    --text-faint: rgba(235, 235, 245, 0.35);
+
+    --accent: #0a84ff;
+    --accent-soft: rgba(10, 132, 255, 0.22);
+    --accent-glow: rgba(10, 132, 255, 0.55);
+
+    --kind-thought: #98989f;
+    --kind-action: #0a84ff;
+    --kind-observation: #30d158;
+    --kind-error: #ff453a;
+    --kind-final: #32d74b;
+
+    --amber: #ffd60a;
+    --amber-soft: rgba(255, 214, 10, 0.18);
+
+    --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+    --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.4);
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  background-image:
+    radial-gradient(1200px 600px at 100% -10%, var(--bg-gradient-1), transparent 60%),
+    radial-gradient(1000px 500px at -10% 110%, var(--bg-gradient-2), transparent 55%);
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: -apple-system, 'SF Pro Text', BlinkMacSystemFont, ui-sans-serif, system-ui,
+    'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* ---- Glass surfaces ---- */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-sm);
+}
+
+.glass-strong {
+  background: var(--glass-bg-strong);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow);
+}
+
+/* ---- Scrollbar (subtle, iOS-like) ---- */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--text-faint);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- Shimmering "thinking" text ---- */
+@keyframes shimmerText {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    var(--text-muted) 0%,
+    var(--text-muted) 35%,
+    var(--text) 50%,
+    var(--text-muted) 65%,
+    var(--text-muted) 100%
+  );
+  background-size: 200% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: shimmerText 1.8s linear infinite;
+}
+
+/* ---- Bouncing "· · ·" thinking dots ---- */
+@keyframes thinkingBounce {
+  0%,
+  70%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  35% {
+    transform: translateY(-5px);
+    opacity: 1;
+  }
+}
+
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.thinking-dots > span {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: thinkingBounce 1.1s ease-in-out infinite;
+}
+
+.thinking-dots > span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.thinking-dots > span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  /* Thinking indicators are essential status feedback — keep them looping
+     even under reduced-motion, since a frozen indicator reads as "hung". */
+  .thinking-dots > span {
+    animation: thinkingBounce 1.1s ease-in-out infinite !important;
+  }
+  .thinking-dots > span:nth-child(2) {
+    animation-delay: 0.16s !important;
+  }
+  .thinking-dots > span:nth-child(3) {
+    animation-delay: 0.32s !important;
+  }
+  .shimmer-text {
+    animation: shimmerText 1.8s linear infinite !important;
+  }
+}
