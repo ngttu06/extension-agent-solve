@@ -7,6 +7,7 @@ import {
   saveSession,
   saveSettings,
 } from '@/shared/storage';
+import { RecipeStore } from '@/shared/recipe-storage';
 import type { Session, ToolCall } from '@/shared/types';
 import { Orchestrator } from './orchestrator';
 
@@ -240,6 +241,21 @@ chrome.runtime.onMessage.addListener((msg: PanelToBackground, _sender, sendRespo
         }
         const sessions = await listSessions();
         send({ type: 'SESSION_LIST', sessions });
+        sendResponse({ ok: true });
+        break;
+      }
+      case 'GET_ACTION_CACHE_STATS': {
+        const settings = await loadSettings();
+        const stats = await new RecipeStore(settings.actionCache).getStats();
+        send({ type: 'ACTION_CACHE_STATS', stats });
+        sendResponse({ ok: true });
+        break;
+      }
+      case 'CLEAR_ACTION_CACHE': {
+        const settings = await loadSettings();
+        const store = new RecipeStore(settings.actionCache);
+        await store.clear();
+        send({ type: 'ACTION_CACHE_STATS', stats: await store.getStats() });
         sendResponse({ ok: true });
         break;
       }

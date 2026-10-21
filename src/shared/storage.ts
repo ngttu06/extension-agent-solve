@@ -19,6 +19,7 @@ export async function loadSettings(): Promise<Settings> {
     ...DEFAULT_SETTINGS,
     ...stored,
     provider: { ...DEFAULT_SETTINGS.provider, ...stored.provider },
+    actionCache: { ...DEFAULT_SETTINGS.actionCache, ...stored.actionCache },
   };
 }
 

@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import type { AgentStep, ChatMessage } from '@/shared/types';
 import { usePanelStore } from '../store';
 import { Markdown } from './Markdown';
+import { useThrottle } from '../hooks/useThrottle';
 
 const KIND_ACCENT: Record<AgentStep['kind'], string> = {
   thought: 'var(--kind-thought)',
@@ -39,7 +40,15 @@ function ThinkingDots() {
 }
 
 /** A single process step rendered inside the collapsible thinking panel. */
-function StepRow({ step, active }: { step: AgentStep; active: boolean }) {
+function StepRow({
+  step,
+  active,
+  showProcessingEffects,
+}: {
+  step: AgentStep;
+  active: boolean;
+  showProcessingEffects: boolean;
+}) {
   const [open, setOpen] = useState(step.kind === 'error');
   const hasDetail = Boolean(step.detail);
   const accent = KIND_ACCENT[step.kind];
@@ -55,7 +64,12 @@ function StepRow({ step, active }: { step: AgentStep; active: boolean }) {
         <span className="flex items-center gap-1.5">
           <span style={{ color: accent }}>{KIND_LABEL[step.kind]}</span>
           <span className="text-muted">· {step.title}</span>
-          {active && (
+          {step.metadata?.source === 'recipe' && (
+            <span className="rounded-full bg-accentSoft px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-accent">
+              cached recipe
+            </span>
+          )}
+          {active && showProcessingEffects && (
             <span className="text-faint">
               <ThinkingDots />
             </span>
@@ -99,7 +113,15 @@ function StepRow({ step, active }: { step: AgentStep; active: boolean }) {
  * expanded with an animated "Thinking …" header; once the turn finishes it
  * auto-collapses to a compact pill the user can re-open.
  */
-function ProcessGroup({ steps, active }: { steps: AgentStep[]; active: boolean }) {
+function ProcessGroup({
+  steps,
+  active,
+  showProcessingEffects,
+}: {
+  steps: AgentStep[];
+  active: boolean;
+  showProcessingEffects: boolean;
+}) {
   // Expanded while running; collapses automatically once the turn is done.
   const [open, setOpen] = useState(active);
   const wasActive = useRef(active);
@@ -114,7 +136,7 @@ function ProcessGroup({ steps, active }: { steps: AgentStep[]; active: boolean }
   return (
     <div
       className={`glass animate-fade-slide overflow-hidden rounded-xl2 text-xs shadow-glassSm transition ${
-        active ? 'animate-breath' : ''
+        active && showProcessingEffects ? 'animate-breath' : ''
       }`}
       style={{ borderLeft: '3px solid var(--kind-thought)' }}
     >
@@ -123,16 +145,16 @@ function ProcessGroup({ steps, active }: { steps: AgentStep[]; active: boolean }
         onClick={() => setOpen((o) => !o)}
       >
         <span className="flex items-center gap-2">
-          <span className={active ? 'shimmer-text' : 'text-content'}>
+          <span className={active && showProcessingEffects ? 'shimmer-text' : 'text-content'}>
             {label}
           </span>
-          {active ? (
+          {active && showProcessingEffects ? (
             <span className="text-accent">
               <ThinkingDots />
             </span>
-          ) : (
+          ) : !active ? (
             <span className="text-faint">· {steps.length} bước</span>
-          )}
+          ) : null}
         </span>
         <span
           className="text-faint transition-transform duration-300"
@@ -148,7 +170,12 @@ function ProcessGroup({ steps, active }: { steps: AgentStep[]; active: boolean }
         <div className="overflow-hidden">
           <div className="space-y-1 border-t border-hairline px-2 py-2">
             {steps.map((step, i) => (
-              <StepRow key={step.id} step={step} active={active && i === steps.length - 1} />
+              <StepRow
+                key={step.id}
+                step={step}
+                active={active && i === steps.length - 1}
+                showProcessingEffects={showProcessingEffects}
+              />
             ))}
           </div>
         </div>
@@ -177,7 +204,7 @@ function FinalAnswer({ step }: { step: AgentStep }) {
  * first step arriving. Once steps exist, the live ProcessGroup header carries
  * the animated "Thinking …" state, so we hide this to avoid duplication.
  */
-function StatusIndicator() {
+function StatusIndicator({ showProcessingEffects }: { showProcessingEffects: boolean }) {
   const running = usePanelStore((s) => s.running);
   const steps = usePanelStore((s) => s.steps);
   if (!running) return null;
@@ -187,10 +214,12 @@ function StatusIndicator() {
   const label = 'Thinking';
   return (
     <div className="glass flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium shadow-glassSm animate-fade-slide">
-      <span className="shimmer-text">{label}</span>
-      <span className="text-accent">
-        <ThinkingDots />
-      </span>
+      <span className={showProcessingEffects ? 'shimmer-text' : 'text-content'}>{label}</span>
+      {showProcessingEffects && (
+        <span className="text-accent">
+          <ThinkingDots />
+        </span>
+      )}
     </div>
   );
 }
@@ -313,59 +342,69 @@ export function ChatView() {
   const lockedTabId = usePanelStore((s) => s.lockedTabId);
   const activeTabId = usePanelStore((s) => s.activeTabId);
   const lockedTabClosed = usePanelStore((s) => s.lockedTabClosed);
+  const showProcessingEffects = usePanelStore((s) => s.settings.showProcessingEffects);
 
   const tabMatches = lockedTabId != null && activeTabId === lockedTabId && !lockedTabClosed;
 
   const [goal, setGoal] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Build a time-ordered timeline of three item kinds:
-  //  - user message bubbles
-  //  - "process" groups: runs of consecutive intermediate steps (thought /
-  //    action / observation / error) folded into one collapsible panel
-  //  - final answers: rendered on their own as persistent, prominent bubbles
-  // Assistant plain-text replies already surface as "thought" steps, so we
-  // don't render assistant message bubbles here (would duplicate the text).
+  // Tối ưu: memoize timeline construction để tránh rebuild khi không cần thiết
+  const timeline = useMemo(() => {
+    // Build a time-ordered timeline of three item kinds:
+    //  - user message bubbles
+    //  - "process" groups: runs of consecutive intermediate steps (thought /
+    //    action / observation / error) folded into one collapsible panel
+    //  - final answers: rendered on their own as persistent, prominent bubbles
+    // Assistant plain-text replies already surface as "thought" steps, so we
+    // don't render assistant message bubbles here (would duplicate the text).
+
+    type TimelineItem =
+      | { kind: 'message'; key: string; ts: number; message: ChatMessage }
+      | { kind: 'process'; key: string; ts: number; steps: AgentStep[] }
+      | { kind: 'final'; key: string; ts: number; step: AgentStep };
+
+    const stepItems: TimelineItem[] = [];
+    let group: AgentStep[] = [];
+    const flush = () => {
+      if (group.length) {
+        stepItems.push({ kind: 'process', key: `g-${group[0].id}`, ts: group[0].timestamp, steps: group });
+        group = [];
+      }
+    };
+    for (const s of steps) {
+      if (s.kind === 'final') {
+        flush();
+        stepItems.push({ kind: 'final', key: `f-${s.id}`, ts: s.timestamp, step: s });
+      } else {
+        group.push(s);
+      }
+    }
+    flush();
+
+    return [
+      ...messages
+        .filter((m) => m.role === 'user')
+        .map((m, i): TimelineItem => ({
+          kind: 'message',
+          key: `m-${i}-${m.timestamp ?? ''}`,
+          message: m,
+          ts: m.timestamp ?? 0,
+        })),
+      ...stepItems,
+    ].sort((a, b) => a.ts - b.ts);
+  }, [steps, messages]);
+
   const lastStepId = steps.length ? steps[steps.length - 1].id : null;
 
-  type TimelineItem =
-    | { kind: 'message'; key: string; ts: number; message: ChatMessage }
-    | { kind: 'process'; key: string; ts: number; steps: AgentStep[] }
-    | { kind: 'final'; key: string; ts: number; step: AgentStep };
-
-  const stepItems: TimelineItem[] = [];
-  let group: AgentStep[] = [];
-  const flush = () => {
-    if (group.length) {
-      stepItems.push({ kind: 'process', key: `g-${group[0].id}`, ts: group[0].timestamp, steps: group });
-      group = [];
-    }
-  };
-  for (const s of steps) {
-    if (s.kind === 'final') {
-      flush();
-      stepItems.push({ kind: 'final', key: `f-${s.id}`, ts: s.timestamp, step: s });
-    } else {
-      group.push(s);
-    }
-  }
-  flush();
-
-  const timeline: TimelineItem[] = [
-    ...messages
-      .filter((m) => m.role === 'user')
-      .map((m, i): TimelineItem => ({
-        kind: 'message',
-        key: `m-${i}-${m.timestamp ?? ''}`,
-        message: m,
-        ts: m.timestamp ?? 0,
-      })),
-    ...stepItems,
-  ].sort((a, b) => a.ts - b.ts);
+  // Tối ưu: throttle scroll updates để tránh scroll quá nhiều khi agent đang xử lý nhanh
+  const throttledScroll = useThrottle(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+  }, 150);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [steps.length, messages.length, running]);
+    throttledScroll();
+  }, [steps.length, messages.length, running, throttledScroll]);
 
   const submit = () => {
     if (!goal.trim() || running || !tabMatches) return;
@@ -403,10 +442,17 @@ export function ChatView() {
           }
           const groupActive =
             running && lastStepId != null && item.steps.some((s) => s.id === lastStepId);
-          return <ProcessGroup key={item.key} steps={item.steps} active={groupActive} />;
+          return (
+            <ProcessGroup
+              key={item.key}
+              steps={item.steps}
+              active={groupActive}
+              showProcessingEffects={showProcessingEffects}
+            />
+          );
         })}
 
-        <StatusIndicator />
+        <StatusIndicator showProcessingEffects={showProcessingEffects} />
 
         {error && (
           <div
@@ -425,7 +471,7 @@ export function ChatView() {
       <div className="glass rounded-t-xl2 p-3">
         <div
           className={`flex items-end gap-2 rounded-xl2 bg-elevated p-1.5 ring-1 ring-hairline transition ${
-            running ? 'animate-breath' : ''
+            running && showProcessingEffects ? 'animate-breath' : ''
           }`}
         >
           <textarea

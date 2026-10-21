@@ -1,6 +1,13 @@
-import type { ToolResult } from '@/shared/types';
-import { getElementByIndex, getVisualElement, observe } from './perception';
+import type {
+  ActionExecutionEvidence,
+  RecipeStep,
+  TargetState,
+  ToolResult,
+} from '@/shared/types';
+import { getElementByIndex, getIndexForElement, getVisualElement, observe } from './perception';
+import { getPageState, markPageStateChanged, waitForPageQuiet } from './page-state';
 import { pointAt } from './overlay';
+import { buildSemanticLocator, isVisible, resolveSemanticLocator } from './semantic-locator';
 
 const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms));
 
@@ -135,7 +142,7 @@ export async function clickElement(index: number): Promise<{ ok: boolean; conten
   const el = getElementByIndex(index);
   if (!el) return { ok: false, content: `No element at index ${index}.` };
   highlight(index);
-  await pointAt(getVisualElement(el));
+  pointAt(getVisualElement(el));
   el.focus?.();
   el.click();
   return { ok: true, content: `Clicked ${elementLabel(el)} at index ${index}.` };
@@ -177,7 +184,7 @@ export async function typeIntoElement(
     };
   }
   highlight(index);
-  await pointAt(getVisualElement(el));
+  pointAt(getVisualElement(el));
   el.focus?.();
 
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -298,7 +305,7 @@ export async function selectOption(
     return { ok: false, content: `Element at index ${index} is not a <select>.` };
   }
   highlight(index);
-  await pointAt(el);
+  pointAt(el);
   const options = Array.from(el.options);
   const match =
     options.find((o) => o.value === value) ||
@@ -355,6 +362,166 @@ export function extract(query: string): { ok: boolean; content: string } {
     ? scored.join('\n')
     : `No direct matches. Page excerpt:\n${snapshot.text.slice(0, 1500)}`;
   return { ok: true, content };
+}
+
+function hashValue(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+export function captureTargetState(el: HTMLElement): TargetState {
+  const editable =
+    el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable;
+  const rawValue =
+    el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement
+      ? el.value
+      : el.isContentEditable
+        ? el.innerText || el.textContent || ''
+        : '';
+  return {
+    visible: isVisible(el),
+    enabled:
+      el.getAttribute('aria-disabled') !== 'true' &&
+      (!(el instanceof HTMLButtonElement || el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) || !el.disabled),
+    editable,
+    valueHash: editable && !(el instanceof HTMLInputElement && el.type === 'password')
+      ? hashValue(rawValue)
+      : undefined,
+    selectedValue: el instanceof HTMLSelectElement ? el.value : undefined,
+    checked: el instanceof HTMLInputElement && ['checkbox', 'radio'].includes(el.type) ? el.checked : undefined,
+    pressed: el.hasAttribute('aria-pressed') ? el.getAttribute('aria-pressed') === 'true' : undefined,
+    expanded: el.hasAttribute('aria-expanded') ? el.getAttribute('aria-expanded') === 'true' : undefined,
+  };
+}
+
+export function isSensitiveElement(el: HTMLElement): boolean {
+  if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return false;
+  const signals = [
+    el instanceof HTMLInputElement ? el.type : '',
+    el.name,
+    el.id,
+    el.autocomplete,
+    el.placeholder,
+    el.getAttribute('aria-label') ?? '',
+  ].join(' ').toLowerCase();
+  return /password|passcode|otp|one.?time|credit|card|cvv|cvc|security.?code|token|secret/.test(signals);
+}
+
+function sameTargetState(expected: TargetState, actual: TargetState): boolean {
+  for (const key of Object.keys(expected) as Array<keyof TargetState>) {
+    if (expected[key] !== undefined && expected[key] !== actual[key]) return false;
+  }
+  return true;
+}
+
+export async function executeIndexedAction(
+  tool: 'click' | 'type' | 'select',
+  index: number,
+  args: Record<string, unknown>,
+): Promise<{ ok: boolean; content: string; evidence?: ActionExecutionEvidence }> {
+  const snapshot = observe();
+  const element = getElementByIndex(index);
+  const locator = snapshot.elements.find((candidate) => candidate.index === index)?.locator;
+  if (!element || !locator) return { ok: false, content: `No element at index ${index}.` };
+  const beforePage = getPageState();
+  const before = captureTargetState(element);
+  const sensitive = isSensitiveElement(element);
+  const started = performance.now();
+  let outcome: { ok: boolean; content: string };
+  if (tool === 'click') outcome = await clickElement(index);
+  else if (tool === 'type') outcome = await typeIntoElement(index, String(args.text ?? ''), Boolean(args.submit));
+  else outcome = await selectOption(index, String(args.value ?? ''));
+  if (!outcome.ok) return outcome;
+  markPageStateChanged();
+  const quiet = await waitForPageQuiet();
+  const afterSnapshot = observe();
+  const afterPage = getPageState();
+  return {
+    ...outcome,
+    evidence: {
+      documentIdBefore: beforePage.documentId,
+      documentIdAfter: afterPage.documentId,
+      revisionBefore: beforePage.revision,
+      revisionAfter: afterPage.revision,
+      urlBefore: snapshot.url,
+      urlAfter: afterSnapshot.url,
+      resolvedLocator: locator,
+      targetStateBefore: before,
+      targetStateAfter: element.isConnected ? captureTargetState(element) : undefined,
+      identityAfter: afterSnapshot.identity,
+      settled: quiet.settled,
+      sensitive,
+      durationMs: Math.round(performance.now() - started),
+    },
+  };
+}
+
+export async function executeRecipeAction(step: RecipeStep): Promise<{
+  ok: boolean;
+  content: string;
+  evidence?: ActionExecutionEvidence;
+}> {
+  if (step.tool === 'navigate') {
+    return { ok: false, content: 'Navigation recipe actions execute in the background context.' };
+  }
+  if (!step.locator) return { ok: false, content: 'Recipe target has no semantic locator.' };
+  observe();
+  const resolution = resolveSemanticLocator(step.locator, step.tool);
+  if (resolution.status !== 'resolved' || !resolution.element) {
+    return { ok: false, content: resolution.reason ?? `Could not resolve recipe target (${resolution.status}).` };
+  }
+  const element = resolution.element;
+  const index = getIndexForElement(element);
+  if (index < 0) return { ok: false, content: 'Resolved target is not bound to the current snapshot.' };
+  const beforePage = getPageState();
+  const beforeSnapshot = observe();
+  const before = captureTargetState(element);
+  if (step.precondition.expectedTargetState && !sameTargetState(step.precondition.expectedTargetState, before)) {
+    return { ok: false, content: 'Target precondition no longer matches the current page.' };
+  }
+  const started = performance.now();
+  let outcome: { ok: boolean; content: string };
+  switch (step.tool) {
+    case 'click':
+      outcome = await clickElement(index);
+      break;
+    case 'type':
+      outcome = await typeIntoElement(index, String(step.args.text ?? ''), false);
+      break;
+    case 'select':
+      outcome = await selectOption(index, String(step.args.value ?? ''));
+      break;
+  }
+  if (!outcome.ok) return outcome;
+  markPageStateChanged();
+  const quiet = await waitForPageQuiet();
+  const afterSnapshot = observe();
+  const afterPage = getPageState();
+  const after = element.isConnected ? captureTargetState(element) : undefined;
+  return {
+    ok: true,
+    content: outcome.content,
+    evidence: {
+      documentIdBefore: beforePage.documentId,
+      documentIdAfter: afterPage.documentId,
+      revisionBefore: beforePage.revision,
+      revisionAfter: afterPage.revision,
+      urlBefore: beforeSnapshot.url,
+      urlAfter: afterSnapshot.url,
+      resolvedLocator: buildSemanticLocator(element, index),
+      locatorScore: resolution.score,
+      targetStateBefore: before,
+      targetStateAfter: after,
+      identityAfter: afterSnapshot.identity,
+      settled: quiet.settled,
+      sensitive: isSensitiveElement(element),
+      durationMs: Math.round(performance.now() - started),
+    },
+  };
 }
 
 /** Build a ToolResult wrapper for an action outcome. */

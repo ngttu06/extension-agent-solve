@@ -8,6 +8,8 @@ const fieldClass =
 export function SettingsView() {
   const settings = usePanelStore((s) => s.settings);
   const saveSettings = usePanelStore((s) => s.saveSettings);
+  const actionCacheStats = usePanelStore((s) => s.actionCacheStats);
+  const clearActionCache = usePanelStore((s) => s.clearActionCache);
   const setView = usePanelStore((s) => s.setView);
 
   const [draft, setDraft] = useState<Settings>(settings);
@@ -117,6 +119,75 @@ export function SettingsView() {
             className={fieldClass}
           />
         </label>
+
+        <div className="glass space-y-3 rounded-xl2 px-3.5 py-3">
+          <span className="block font-medium text-content">Visual effects</span>
+          <label className="flex items-start gap-3">
+            <input
+              type="checkbox"
+              checked={draft.showVirtualCursor}
+              onChange={(e) => update({ showVirtualCursor: e.target.checked })}
+              className="mt-0.5 h-4 w-4 accent-[color:var(--accent)]"
+            />
+            <span>
+              <span className="block text-content">Show virtual mouse cursor</span>
+              <span className="mt-1 block text-xs leading-relaxed text-muted">
+                Shows cursor movement, press animation and click ripple on the controlled page.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-3">
+            <input
+              type="checkbox"
+              checked={draft.showProcessingEffects}
+              onChange={(e) => update({ showProcessingEffects: e.target.checked })}
+              className="mt-0.5 h-4 w-4 accent-[color:var(--accent)]"
+            />
+            <span>
+              <span className="block text-content">Show AI processing effects</span>
+              <span className="mt-1 block text-xs leading-relaxed text-muted">
+                Shows the page control glow and animated processing indicators in the side panel.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div className="glass space-y-3 rounded-xl2 px-3.5 py-3">
+          <label className="flex items-start gap-3">
+            <input
+              type="checkbox"
+              checked={draft.actionCache.enabled}
+              onChange={(e) =>
+                setDraft((current) => ({
+                  ...current,
+                  actionCache: { ...current.actionCache, enabled: e.target.checked },
+                }))
+              }
+              className="mt-0.5 h-4 w-4 accent-[color:var(--accent)]"
+            />
+            <span>
+              <span className="block font-medium text-content">Reuse validated action recipes</span>
+              <span className="mt-1 block text-xs leading-relaxed text-muted">
+                Replays only the same goal on a tightly matching page. Actions run again on the current DOM,
+                confirmation still applies, and any mismatch returns control to the agent.
+              </span>
+            </span>
+          </label>
+          <div className="grid grid-cols-2 gap-2 text-xs text-muted">
+            <span>{actionCacheStats.recipeCount} recipes</span>
+            <span>{Math.round(actionCacheStats.byteSize / 1024)} KB</span>
+            <span>{actionCacheStats.successfulReplays} successful replays</span>
+            <span>{actionCacheStats.divergences} divergences</span>
+          </div>
+          <button
+            type="button"
+            onClick={clearActionCache}
+            disabled={actionCacheStats.recipeCount === 0}
+            className="w-full rounded-full bg-elevated px-3 py-2 text-xs font-medium text-content ring-1 ring-hairline transition disabled:opacity-40 active:scale-[0.98]"
+          >
+            Clear action cache
+          </button>
+        </div>
       </div>
 
       <div className="glass rounded-t-xl2 p-4">

@@ -2,9 +2,12 @@ import type { BackgroundToContent, ContentToBackground } from '@/shared/messages
 import { TOOL_SCHEMAS } from '@/shared/tools';
 import {
   RISKY_TOOLS,
+  type ActionExecutionEvidence,
+  type ActionRecipe,
   type AgentStep,
   type ChatMessage,
   type PageSnapshot,
+  type RecipeStep,
   type Settings,
   type ToolCall,
   type ToolResult,
@@ -12,6 +15,12 @@ import {
 import { createProvider, isRetryableProviderError } from './providers';
 import { renderSnapshot, SYSTEM_PROMPT } from './prompt';
 import { DEFAULT_RETRIES, withRetry } from '@/shared/retry';
+import {
+  RecipeEngine,
+  summarizeExecutedRecipe,
+  validateRecipePostconditions,
+  validateRecipePrecondition,
+} from './recipe-engine';
 
 /** Extract a readable message from an unknown thrown value. */
 function errMessage(err: unknown): string {
@@ -33,8 +42,24 @@ function isTransientToolFailure(content: string): boolean {
   );
 }
 
-/** These tools may have completed before their response was lost. Never replay them. */
-const NEVER_RETRY_TOOLS: ToolCall['name'][] = ['edit_html', 'execute_javascript'];
+/** Side-effect tools may have completed before their response was lost. Never replay them. */
+const NEVER_RETRY_TOOLS: ToolCall['name'][] = [
+  'click',
+  'type',
+  'select',
+  'scroll',
+  'navigate',
+  'go_back',
+  'edit_html',
+  'execute_javascript',
+];
+
+const PARALLEL_READ_ONLY_TOOLS = new Set<ToolCall['name']>([
+  'observe_page',
+  'inspect_html',
+  'extract',
+  'screenshot',
+]);
 
 function preview(value: unknown, maxLength = 180): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -80,6 +105,12 @@ export class Orchestrator {
   private messages: ChatMessage[] = [];
   private abort = new AbortController();
   private stopped = false;
+  private observationInFlight: Promise<PageSnapshot | null> | null = null;
+  private lastSnapshot: PageSnapshot | null = null;
+  private lastExecutionEvidence: ActionExecutionEvidence | undefined;
+  private recipeEngine: RecipeEngine;
+  private goal = '';
+  private pendingReplayVerification: { recipeId: string; steps: number; durationMs: number } | null = null;
 
   constructor(
     private settings: Settings,
@@ -87,7 +118,9 @@ export class Orchestrator {
     /** Transcript from earlier turns in this session, replayed for continuity. */
     private priorMessages: ChatMessage[],
     private hooks: OrchestratorHooks,
-  ) {}
+  ) {
+    this.recipeEngine = new RecipeEngine(settings);
+  }
 
   stop(): void {
     this.stopped = true;
@@ -96,12 +129,14 @@ export class Orchestrator {
   }
 
   /** Toggle the on-page control glow; tolerant of missing content script. */
-  private async setGlow(on: boolean): Promise<void> {
+  private async setGlow(on: boolean, activeAction = false): Promise<void> {
     try {
       await this.ensureContentScript();
       await chrome.tabs.sendMessage(this.tabId, {
         type: 'SET_CONTROL_GLOW',
-        on,
+        on: on && this.settings.showProcessingEffects,
+        activeAction,
+        showCursor: this.settings.showVirtualCursor,
       } satisfies BackgroundToContent);
     } catch {
       // Tab closed, navigating, or content script not injected yet.
@@ -114,17 +149,47 @@ export class Orchestrator {
       return;
     }
 
+    this.goal = goal;
     const provider = createProvider(this.settings.provider);
-
     this.messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...trimHistory(this.priorMessages),
       { role: 'user', content: `Goal: ${goal}` },
     ];
 
-    // Light up the tab so the user can see which page the agent controls.
     await this.setGlow(true);
     try {
+      const initial = await this.observe(true);
+      this.recipeEngine.begin(initial);
+      if (initial && this.settings.actionCache.enabled) {
+        this.hooks.onStep(step({
+          kind: 'thought',
+          title: 'Checking action cache',
+          detail: 'Looking for a validated recipe for the same goal and page.',
+          metadata: { source: 'system', cacheStatus: 'lookup' },
+        }));
+        const recipe = await this.recipeEngine.lookup(goal, initial);
+        if (recipe) {
+          const replay = await this.replayRecipe(recipe, initial);
+          if (replay.snapshot) {
+            this.messages.push({ role: 'user', content: replay.report });
+            this.messages.push({
+              role: 'user',
+              content: `Fresh page snapshot after recipe replay:\n${renderSnapshot(replay.snapshot)}`,
+            });
+          }
+        } else {
+          this.hooks.onStep(step({
+            kind: 'observation',
+            title: 'Action cache miss',
+            detail: 'No safe matching recipe; continuing with the agent.',
+            metadata: { source: 'system', cacheStatus: 'miss' },
+          }));
+          this.messages.push({ role: 'user', content: `Current page snapshot:\n${renderSnapshot(initial)}` });
+        }
+      } else if (initial) {
+        this.messages.push({ role: 'user', content: `Current page snapshot:\n${renderSnapshot(initial)}` });
+      }
       await this.loop(provider);
     } finally {
       await this.setGlow(false);
@@ -132,14 +197,6 @@ export class Orchestrator {
   }
 
   private async loop(provider: ReturnType<typeof createProvider>): Promise<void> {
-    // Seed with an initial observation so the model starts grounded.
-    const initial = await this.observe();
-    if (initial) {
-      this.messages.push({
-        role: 'user',
-        content: `Current page snapshot:\n${renderSnapshot(initial)}`,
-      });
-    }
 
     for (let iter = 0; iter < this.settings.maxSteps; iter += 1) {
       if (this.stopped) return;
@@ -192,18 +249,47 @@ export class Orchestrator {
         toolCalls: response.toolCalls,
       });
 
-      // Execute each requested tool sequentially.
-      for (const call of response.toolCalls) {
+      for (let index = 0; index < response.toolCalls.length;) {
         if (this.stopped) return;
+        const call = response.toolCalls[index];
+        if (PARALLEL_READ_ONLY_TOOLS.has(call.name)) {
+          const batch: ToolCall[] = [];
+          while (
+            index < response.toolCalls.length &&
+            PARALLEL_READ_ONLY_TOOLS.has(response.toolCalls[index].name)
+          ) {
+            batch.push(response.toolCalls[index]);
+            index += 1;
+          }
+          const results = await Promise.all(batch.map((entry) => this.withToolRetry(entry)));
+          for (let resultIndex = 0; resultIndex < batch.length; resultIndex += 1) {
+            this.pushToolResult(batch[resultIndex], results[resultIndex]);
+          }
+          continue;
+        }
+        index += 1;
 
         if (call.name === 'finish') {
           const summary = String(call.args.summary ?? 'Task complete.');
+          if (this.pendingReplayVerification) {
+            const verification = this.pendingReplayVerification;
+            await this.recipeEngine.store.recordSuccess(
+              verification.recipeId,
+              verification.steps,
+              verification.durationMs,
+            );
+            this.pendingReplayVerification = null;
+          } else {
+            await this.recipeEngine.maybeLearn(this.goal);
+          }
           this.hooks.onStep(step({ kind: 'final', title: 'Finished', detail: summary }));
           this.hooks.onDone(summary);
           return;
         }
 
         if (call.name === 'ask_user') {
+          this.pendingReplayVerification = null;
+          this.recipeEngine.disqualify();
           const question = String(call.args.question ?? 'Could you clarify?');
           this.hooks.onStep(step({ kind: 'action', title: 'Asking user', detail: question }));
           const answer = await this.hooks.askUser(question);
@@ -216,11 +302,11 @@ export class Orchestrator {
           continue;
         }
 
-        // Confirmation gate for risky tools in confirm mode.
         if (this.settings.mode === 'confirm' && RISKY_TOOLS.includes(call.name)) {
           const description = this.describeCall(call);
           const approved = await this.hooks.requestConfirm(call, description);
           if (!approved) {
+            this.recipeEngine.disqualify();
             this.pushToolResult(call, {
               id: call.id,
               name: call.name,
@@ -231,24 +317,173 @@ export class Orchestrator {
           }
         }
 
+        if (this.pendingReplayVerification) this.pendingReplayVerification = null;
+        const before = this.lastSnapshot ?? await this.observe(true);
+        await this.setGlow(true, true); // Báo hiệu action đang thực thi
         const result = await this.withToolRetry(call);
+        const after = await this.observe(true);
+        this.recipeEngine.recordExecution(call, result, before, after, this.lastExecutionEvidence);
         this.pushToolResult(call, result);
+        // Tối ưu: giảm animation khi không có action đang xảy ra
+        await this.setGlow(true, false);
       }
     }
 
     this.hooks.onError(`Reached max steps (${this.settings.maxSteps}) without finishing.`);
   }
 
+  private async replayRecipe(
+    recipe: ActionRecipe,
+    initial: PageSnapshot,
+  ): Promise<{ snapshot: PageSnapshot | null; report: string }> {
+    const started = performance.now();
+    const executed: RecipeStep[] = [];
+    let current = initial;
+    this.hooks.onStep(step({
+      kind: 'action',
+      title: `Action cache hit (${recipe.steps.length} steps)`,
+      detail: 'Re-validating every target and postcondition before continuing.',
+      metadata: { source: 'recipe', cacheStatus: 'hit' },
+    }));
+    for (let index = 0; index < recipe.steps.length; index += 1) {
+      const recipeStep = recipe.steps[index];
+      if (this.stopped) break;
+      if (!validateRecipePrecondition(recipeStep, current)) {
+        await this.recipeEngine.store.recordDivergence(recipe.id);
+        return this.recipeFallbackReport(executed, `Precondition failed at step ${index + 1}.`);
+      }
+      const syntheticCall: ToolCall = {
+        id: uid(),
+        name: recipeStep.tool,
+        args: {
+          ...recipeStep.args,
+          target: recipeStep.locator?.accessibleName ?? recipeStep.locator?.tag,
+        },
+      };
+      if (this.settings.mode === 'confirm' && RISKY_TOOLS.includes(syntheticCall.name)) {
+        const approved = await this.hooks.requestConfirm(
+          syntheticCall,
+          `Replay cached step ${index + 1}/${recipe.steps.length}: ${this.describeRecipeStep(recipeStep)}`,
+        );
+        if (!approved) {
+          const snapshot = await this.observe(true);
+          return {
+            snapshot,
+            report: `Cached replay stopped because the user denied step ${index + 1}. No cached result was assumed. ${executed.length} step(s) had already executed.`,
+          };
+        }
+      }
+      this.hooks.onStep(step({
+        kind: 'action',
+        title: `Replaying step ${index + 1}/${recipe.steps.length}`,
+        detail: this.describeRecipeStep(recipeStep),
+        metadata: { source: 'recipe', cacheStatus: 'replaying' },
+      }));
+      const before = current;
+      const outcome = await this.executeRecipeStep(recipeStep);
+      current = (await this.observe(true)) ?? current;
+      if (!outcome.ok || !validateRecipePostconditions(recipeStep, before, current, outcome.evidence)) {
+        await this.recipeEngine.store.recordDivergence(recipe.id);
+        return this.recipeFallbackReport(
+          executed,
+          `Step ${index + 1} diverged: ${outcome.content}`,
+        );
+      }
+      executed.push(recipeStep);
+    }
+    if (executed.length === recipe.steps.length) {
+      const durationMs = Math.round(performance.now() - started);
+      this.pendingReplayVerification = { recipeId: recipe.id, steps: executed.length, durationMs };
+      this.hooks.onStep(step({
+        kind: 'observation',
+        title: 'Cached actions re-executed',
+        detail: `${executed.length} action(s) ran on the current DOM and passed local postconditions. The agent will verify the goal now.`,
+        metadata: { source: 'recipe', cacheStatus: 'replaying', durationMs },
+      }));
+      return {
+        snapshot: current,
+        report: `A cached action recipe was re-executed against the current DOM. Every listed action was performed now and passed its local postconditions:\n${summarizeExecutedRecipe(executed)}\nVerify the user's goal from the fresh snapshot. Finish only if it is actually complete.`,
+      };
+    }
+    return this.recipeFallbackReport(executed, 'Replay stopped.');
+  }
+
+  private async recipeFallbackReport(
+    executed: RecipeStep[],
+    reason: string,
+  ): Promise<{ snapshot: PageSnapshot | null; report: string }> {
+    this.pendingReplayVerification = null;
+    this.hooks.onStep(step({
+      kind: 'error',
+      title: 'Cached recipe diverged',
+      detail: `${reason} The agent is resuming from the current page state.`,
+      metadata: { source: 'recipe', cacheStatus: 'diverged' },
+    }));
+    const snapshot = await this.observe(true);
+    return {
+      snapshot,
+      report: `Cached recipe replay diverged and stopped. ${reason}\nActions that actually ran before stopping:\n${executed.length ? summarizeExecutedRecipe(executed) : '(none)'}\nContinue from the fresh current state. Do not assume unexecuted cached steps occurred.`,
+    };
+  }
+
+  private describeRecipeStep(recipeStep: RecipeStep): string {
+    switch (recipeStep.tool) {
+      case 'click':
+        return `Click ${recipeStep.locator?.accessibleName ?? recipeStep.locator?.tag ?? 'target'}`;
+      case 'type':
+        return `Fill ${String(recipeStep.args.text ?? '').length} character(s) into ${recipeStep.locator?.accessibleName ?? 'target'}`;
+      case 'select':
+        return `Select "${String(recipeStep.args.value ?? '')}" in ${recipeStep.locator?.accessibleName ?? 'target'}`;
+      case 'navigate':
+        return `Navigate to ${String(recipeStep.args.url ?? '')}`;
+    }
+  }
+
+  private async executeRecipeStep(recipeStep: RecipeStep): Promise<{
+    ok: boolean;
+    content: string;
+    evidence?: ActionExecutionEvidence;
+  }> {
+    if (recipeStep.tool === 'navigate') {
+      try {
+        const url = String(recipeStep.args.url ?? '');
+        await this.navigateAndWait(url);
+        const snapshot = await this.observe(true);
+        return {
+          ok: Boolean(snapshot),
+          content: snapshot ? `Navigated to ${url}.` : 'Navigation completed but the page could not be observed.',
+        };
+      } catch (err) {
+        return { ok: false, content: `Navigation failed: ${errMessage(err)}` };
+      }
+    }
+    await this.ensureContentScript();
+    try {
+      const response = (await chrome.tabs.sendMessage(this.tabId, {
+        type: 'EXECUTE_RECIPE_ACTION',
+        step: recipeStep,
+      } satisfies BackgroundToContent)) as ContentToBackground;
+      if (response?.type === 'RECIPE_ACTION_RESULT') return response;
+      return { ok: false, content: 'No recipe result from content script.' };
+    } catch (err) {
+      return { ok: false, content: `Recipe transport failed: ${errMessage(err)}` };
+    }
+  }
+
   private describeCall(call: ToolCall): string {
     switch (call.name) {
       case 'click':
-        return `Click element #${call.args.index}`;
+        return call.args.target
+          ? `Click ${String(call.args.target)}`
+          : `Click element #${call.args.index}`;
       case 'type':
-        return `Fill ${String(call.args.text ?? '').length} character(s) into element #${call.args.index}${
-          call.args.submit ? ' and submit' : ''
-        }`;
+        return `Fill ${String(call.args.text ?? '').length} character(s) into ${
+          call.args.target ? String(call.args.target) : `element #${call.args.index}`
+        }${call.args.submit ? ' and submit' : ''}`;
       case 'select':
-        return `Select "${call.args.value}" in element #${call.args.index}`;
+        return `Select "${call.args.value}" in ${
+          call.args.target ? String(call.args.target) : `element #${call.args.index}`
+        }`;
       case 'navigate':
         return `Navigate to ${call.args.url}`;
       case 'edit_html':
@@ -319,6 +554,7 @@ export class Orchestrator {
   }
 
   private async executeTool(call: ToolCall): Promise<ToolResult> {
+    this.lastExecutionEvidence = undefined;
     try {
       switch (call.name) {
         case 'observe_page': {
@@ -336,11 +572,8 @@ export class Orchestrator {
         }
         case 'navigate': {
           const url = String(call.args.url);
-          await chrome.tabs.update(this.tabId, { url });
-          await this.waitForLoad();
-          // Fresh page dropped the overlay — re-apply it.
-          await this.setGlow(true);
-          const snap = await this.observe();
+          await this.navigateAndWait(url);
+          const snap = await this.observe(true);
           return {
             id: call.id,
             name: call.name,
@@ -349,9 +582,7 @@ export class Orchestrator {
           };
         }
         case 'go_back': {
-          await chrome.tabs.goBack(this.tabId);
-          await this.waitForLoad();
-          await this.setGlow(true);
+          await this.goBackAndWait();
           return { id: call.id, name: call.name, ok: true, content: 'Navigated back.' };
         }
         case 'screenshot': {
@@ -453,8 +684,8 @@ export class Orchestrator {
 
     const res = (await chrome.tabs.sendMessage(this.tabId, cmd)) as ContentToBackground;
     if (res?.type === 'ACTION_RESULT') {
-      // Give the page a beat to react, then let the model re-observe next turn.
-      await new Promise((r) => setTimeout(r, 400));
+      this.lastExecutionEvidence = res.evidence;
+      if (!['inspect_html', 'extract'].includes(call.name)) this.lastSnapshot = null;
       return res.result;
     }
     return { id: call.id, name: call.name, ok: false, content: 'No response from content script.' };
@@ -495,18 +726,27 @@ export class Orchestrator {
     }
   }
 
-  private async observe(): Promise<PageSnapshot | null> {
-    await this.ensureContentScript();
-    try {
-      const res = (await chrome.tabs.sendMessage(this.tabId, {
-        type: 'OBSERVE',
-      } satisfies BackgroundToContent)) as ContentToBackground;
-      if (res?.type === 'SNAPSHOT') return res.snapshot;
-      return null;
-    } catch {
-      // Content script may not be injected yet (e.g. after navigation).
-      return null;
-    }
+  private async observe(force = false): Promise<PageSnapshot | null> {
+    if (!force && this.lastSnapshot) return this.lastSnapshot;
+    if (this.observationInFlight) return this.observationInFlight;
+    this.observationInFlight = (async () => {
+      await this.ensureContentScript();
+      try {
+        const res = (await chrome.tabs.sendMessage(this.tabId, {
+          type: 'OBSERVE',
+        } satisfies BackgroundToContent)) as ContentToBackground;
+        if (res?.type === 'SNAPSHOT') {
+          this.lastSnapshot = res.snapshot;
+          return res.snapshot;
+        }
+        return null;
+      } catch {
+        return null;
+      } finally {
+        this.observationInFlight = null;
+      }
+    })();
+    return this.observationInFlight;
   }
 
   private async captureScreenshot(): Promise<string> {
@@ -601,25 +841,60 @@ export class Orchestrator {
     }
   }
 
-  private async waitForLoad(timeout = 8000): Promise<void> {
-    await new Promise<void>((resolve) => {
-      const start = Date.now();
-      const check = async () => {
-        try {
-          const tab = await chrome.tabs.get(this.tabId);
-          if (tab.status === 'complete' || Date.now() - start > timeout) {
-            resolve();
-            return;
-          }
-        } catch {
-          resolve();
-          return;
-        }
-        setTimeout(check, 300);
+  private async navigateAndWait(url: string): Promise<void> {
+    const ready = this.waitForTabReady(url);
+    await chrome.tabs.update(this.tabId, { url });
+    this.lastSnapshot = null;
+    await ready;
+    await this.setGlow(true);
+    await this.waitForContentQuiet();
+  }
+
+  private async goBackAndWait(): Promise<void> {
+    const ready = this.waitForTabReady();
+    await chrome.tabs.goBack(this.tabId);
+    this.lastSnapshot = null;
+    await ready;
+    await this.setGlow(true);
+    await this.waitForContentQuiet();
+  }
+
+  private waitForTabReady(expectedUrl?: string, timeout = 8000): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
       };
-      check();
+      const listener = (
+        tabId: number,
+        changeInfo: chrome.tabs.TabChangeInfo,
+        tab: chrome.tabs.Tab,
+      ) => {
+        if (tabId !== this.tabId) return;
+        if (changeInfo.status === 'complete' && (!expectedUrl || tab.url?.startsWith(expectedUrl))) finish();
+      };
+      const timer = setTimeout(finish, timeout);
+      chrome.tabs.onUpdated.addListener(listener);
+      void chrome.tabs.get(this.tabId).then((tab) => {
+        if (tab.status === 'complete' && (!expectedUrl || tab.url?.startsWith(expectedUrl))) finish();
+      }).catch(finish);
     });
-    // Small settle delay for SPA rendering.
-    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  private async waitForContentQuiet(): Promise<void> {
+    try {
+      await this.ensureContentScript();
+      await chrome.tabs.sendMessage(this.tabId, {
+        type: 'WAIT_FOR_PAGE_QUIET',
+        quietMs: 100,
+        timeoutMs: 1400,
+      } satisfies BackgroundToContent);
+    } catch {
+      // Restricted or still-loading pages fall back to the next observation.
+    }
   }
 }

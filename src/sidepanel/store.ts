@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { BackgroundToPanel, PanelToBackground } from '@/shared/messages';
 import {
   DEFAULT_SETTINGS,
+  type ActionCacheStats,
   type AgentStep,
   type ChatMessage,
   type SessionSummary,
@@ -16,11 +17,26 @@ interface ConfirmRequest {
 
 type View = 'chat' | 'settings' | 'history';
 
+const EMPTY_CACHE_STATS: ActionCacheStats = {
+  recipeCount: 0,
+  byteSize: 0,
+  hits: 0,
+  misses: 0,
+  successfulReplays: 0,
+  divergences: 0,
+  replayedSteps: 0,
+  avoidedModelTurns: 0,
+  totalReplayMs: 0,
+};
+
+let initialized = false;
+
 interface PanelState {
   running: boolean;
   steps: AgentStep[];
   messages: ChatMessage[];
   settings: Settings;
+  actionCacheStats: ActionCacheStats;
   sessions: SessionSummary[];
   confirmRequest: ConfirmRequest | null;
   askQuestion: string | null;
@@ -42,6 +58,8 @@ interface PanelState {
   answerConfirm: (approved: boolean) => void;
   answerQuestion: (text: string) => void;
   saveSettings: (settings: Settings) => void;
+  loadActionCacheStats: () => void;
+  clearActionCache: () => void;
   newSession: () => void;
   listSessions: () => void;
   loadSession: (id: string) => void;
@@ -68,6 +86,7 @@ export const usePanelStore = create<PanelState>((set, get) => ({
   steps: [],
   messages: [],
   settings: DEFAULT_SETTINGS,
+  actionCacheStats: EMPTY_CACHE_STATS,
   sessions: [],
   confirmRequest: null,
   askQuestion: null,
@@ -79,6 +98,8 @@ export const usePanelStore = create<PanelState>((set, get) => ({
   lockedTabClosed: false,
 
   init: () => {
+    if (initialized) return;
+    initialized = true;
     chrome.runtime.onMessage.addListener((msg: BackgroundToPanel) => {
       switch (msg.type) {
         case 'STATE':
@@ -110,6 +131,9 @@ export const usePanelStore = create<PanelState>((set, get) => ({
         case 'SETTINGS':
           set({ settings: msg.settings });
           break;
+        case 'ACTION_CACHE_STATS':
+          set({ actionCacheStats: msg.stats });
+          break;
         case 'DONE':
           set({ running: false });
           break;
@@ -135,6 +159,7 @@ export const usePanelStore = create<PanelState>((set, get) => ({
     void lockToActiveTab(set);
 
     post({ type: 'GET_SETTINGS' });
+    post({ type: 'GET_ACTION_CACHE_STATS' });
     post({ type: 'GET_STATE' });
   },
 
@@ -185,6 +210,14 @@ export const usePanelStore = create<PanelState>((set, get) => ({
   saveSettings: (settings) => {
     post({ type: 'SAVE_SETTINGS', settings });
     set({ settings, view: 'chat' });
+  },
+
+  loadActionCacheStats: () => {
+    post({ type: 'GET_ACTION_CACHE_STATS' });
+  },
+
+  clearActionCache: () => {
+    post({ type: 'CLEAR_ACTION_CACHE' });
   },
 
   newSession: () => {

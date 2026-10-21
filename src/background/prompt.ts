@@ -14,6 +14,7 @@ Guidelines:
 - If the page relies on visuals the DOM text cannot convey (canvas, images, charts), use the screenshot tool to see it.
 - If you are blocked, need credentials, or must make a judgement the user should confirm, use ask_user.
 - When the goal is achieved, call finish with a short summary. Do not keep acting after finishing.
+- You may receive a cached recipe replay report. It only describes actions that were re-executed now; verify the attached fresh snapshot before finishing, and never assume an unexecuted cached step occurred.
 - Be careful with destructive or irreversible actions (purchases, deletions, sending messages). Explain your intent in the accompanying text.
 
 Keep your reasoning concise. Emit tool calls to make progress rather than long explanations.`;

@@ -9,15 +9,22 @@ const CURSOR_ID = 'agent-virtual-cursor';
 const ACCENT = '#0a84ff';
 const CURSOR_FILL = '#a9c1f5';
 const MAX_Z = '2147483647';
+let virtualCursorEnabled = true;
+let cursorMoveTimeout: number | null = null;
+let glowAnimationPaused = false;
 
 function ensureStyle(): void {
   if (document.getElementById(STYLE_ID)) return;
   const style = document.createElement('style');
   style.id = STYLE_ID;
+  style.dataset.agentOverlay = 'true';
   style.textContent = `
     @keyframes agent-breath {
       0%, 100% { box-shadow: inset 0 0 0 2px rgba(10,132,255,0.5), inset 0 0 22px rgba(10,132,255,0.25); }
       50% { box-shadow: inset 0 0 0 3px rgba(10,132,255,0.9), inset 0 0 60px rgba(10,132,255,0.5); }
+    }
+    @keyframes agent-breath-paused {
+      0%, 100% { box-shadow: inset 0 0 0 2px rgba(10,132,255,0.3), inset 0 0 16px rgba(10,132,255,0.15); }
     }
     @keyframes agent-cursor-press {
       0% { transform: translate(-50%, -50%) scale(1); }
@@ -36,29 +43,41 @@ function ensureStyle(): void {
 // Control glow
 // ---------------------------------------------------------------------------
 
-export function showControlGlow(): void {
+export function showControlGlow(activeAction = false): void {
   ensureStyle();
   let glow = document.getElementById(GLOW_ID);
   if (!glow) {
     glow = document.createElement('div');
     glow.id = GLOW_ID;
+    glow.dataset.agentOverlay = 'true';
     Object.assign(glow.style, {
       position: 'fixed',
       inset: '0',
       pointerEvents: 'none',
       zIndex: MAX_Z,
       borderRadius: '4px',
-      animation: 'agent-breath 2.4s ease-in-out infinite',
+      animation: activeAction ? 'agent-breath 2.4s ease-in-out infinite' : 'agent-breath-paused 1s ease-in-out',
       transition: 'opacity 0.3s ease',
       opacity: '0',
     } as CSSStyleDeclaration);
     document.documentElement.appendChild(glow);
+    glowAnimationPaused = !activeAction;
     // Next frame so the opacity transition runs.
     requestAnimationFrame(() => {
       glow!.style.opacity = '1';
     });
   } else {
     glow.style.opacity = '1';
+    // Tối ưu: chỉ thay đổi animation khi cần thiết
+    const shouldAnimate = activeAction && glowAnimationPaused;
+    const shouldPause = !activeAction && !glowAnimationPaused;
+    if (shouldAnimate) {
+      glow.style.animation = 'agent-breath 2.4s ease-in-out infinite';
+      glowAnimationPaused = false;
+    } else if (shouldPause) {
+      glow.style.animation = 'agent-breath-paused 1s ease-in-out';
+      glowAnimationPaused = true;
+    }
   }
 }
 
@@ -81,6 +100,7 @@ function cursorEl(): HTMLElement {
   if (!cursor) {
     cursor = document.createElement('div');
     cursor.id = CURSOR_ID;
+    cursor.dataset.agentOverlay = 'true';
     Object.assign(cursor.style, {
       position: 'fixed',
       left: '0',
@@ -107,15 +127,32 @@ function cursorEl(): HTMLElement {
 function hideCursor(): void {
   const cursor = document.getElementById(CURSOR_ID);
   if (cursor) cursor.style.opacity = '0';
+  document.querySelectorAll('[data-agent-cursor-ripple="true"]').forEach((element) => element.remove());
+}
+
+export function setVirtualCursorEnabled(enabled: boolean): void {
+  virtualCursorEnabled = enabled;
+  if (!enabled) hideCursor();
 }
 
 /** Glide the virtual cursor to viewport coordinates and settle briefly. */
 export function moveCursorTo(x: number, y: number): Promise<void> {
+  // Tối ưu: debounce rapid cursor movements
+  if (cursorMoveTimeout !== null) {
+    window.clearTimeout(cursorMoveTimeout);
+  }
+
   const cursor = cursorEl();
   cursor.style.opacity = '1';
   cursor.style.left = `${x}px`;
   cursor.style.top = `${y}px`;
-  return new Promise((resolve) => window.setTimeout(resolve, 380));
+
+  return new Promise((resolve) => {
+    cursorMoveTimeout = window.setTimeout(() => {
+      cursorMoveTimeout = null;
+      resolve();
+    }, 380);
+  });
 }
 
 /** Play a press animation plus a ripple at the cursor's current position. */
@@ -131,6 +168,8 @@ export function cursorPress(): void {
   }
 
   const ripple = document.createElement('div');
+  ripple.dataset.agentOverlay = 'true';
+  ripple.dataset.agentCursorRipple = 'true';
   Object.assign(ripple.style, {
     position: 'fixed',
     left: cursor.style.left,
@@ -148,11 +187,11 @@ export function cursorPress(): void {
   window.setTimeout(() => ripple.remove(), 520);
 }
 
-/** Move the cursor to an element's center and press. */
-export async function pointAt(el: HTMLElement): Promise<void> {
+/** Show the pointer animation without delaying the underlying page action. */
+export function pointAt(el: HTMLElement): void {
+  if (!virtualCursorEnabled) return;
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
-  await moveCursorTo(cx, cy);
-  cursorPress();
+  void moveCursorTo(cx, cy).then(cursorPress);
 }

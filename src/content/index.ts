@@ -1,17 +1,19 @@
 import type { BackgroundToContent, ContentToBackground } from '@/shared/messages';
 import {
-  clickElement,
   editHtml,
+  executeIndexedAction,
+  executeRecipeAction,
   extract,
   highlight,
   inspectHtml,
   scrollPage,
-  selectOption,
   toResult,
-  typeIntoElement,
 } from './actions';
 import { observe } from './perception';
-import { hideControlGlow, showControlGlow } from './overlay';
+import { startPageStateTracker, waitForPageQuiet } from './page-state';
+import { hideControlGlow, setVirtualCursorEnabled, showControlGlow } from './overlay';
+
+startPageStateTracker();
 
 // The content script executes only the structured DOM commands below. MAIN-world
 // JavaScript execution is isolated in the background's confirmed CDP handler.
@@ -52,25 +54,34 @@ chrome.runtime.onMessage.addListener(
             return;
           }
           case 'CLICK': {
+            const outcome = await executeIndexedAction('click', msg.index, {});
             const res: ContentToBackground = {
               type: 'ACTION_RESULT',
-              result: toResult('', 'click', await clickElement(msg.index)),
+              result: toResult('', 'click', outcome),
+              evidence: outcome.evidence,
             };
             sendResponse(res);
             return;
           }
           case 'TYPE': {
+            const outcome = await executeIndexedAction('type', msg.index, {
+              text: msg.text,
+              submit: msg.submit,
+            });
             const res: ContentToBackground = {
               type: 'ACTION_RESULT',
-              result: toResult('', 'type', await typeIntoElement(msg.index, msg.text, msg.submit)),
+              result: toResult('', 'type', outcome),
+              evidence: outcome.evidence,
             };
             sendResponse(res);
             return;
           }
           case 'SELECT': {
+            const outcome = await executeIndexedAction('select', msg.index, { value: msg.value });
             const res: ContentToBackground = {
               type: 'ACTION_RESULT',
-              result: toResult('', 'select', await selectOption(msg.index, msg.value)),
+              result: toResult('', 'select', outcome),
+              evidence: outcome.evidence,
             };
             sendResponse(res);
             return;
@@ -100,12 +111,34 @@ chrome.runtime.onMessage.addListener(
             return;
           }
           case 'SET_CONTROL_GLOW': {
-            if (msg.on) showControlGlow();
+            setVirtualCursorEnabled(msg.showCursor);
+            if (msg.on) showControlGlow(msg.activeAction ?? false);
             else hideControlGlow();
             sendResponse({
               type: 'ACTION_RESULT',
               result: toResult('', 'observe_page', { ok: true, content: 'glow updated' }),
             });
+            return;
+          }
+          case 'GET_PAGE_STATE': {
+            sendResponse({ type: 'PAGE_STATE', identity: observe().identity } satisfies ContentToBackground);
+            return;
+          }
+          case 'WAIT_FOR_PAGE_QUIET': {
+            const quiet = await waitForPageQuiet(msg.quietMs, msg.timeoutMs);
+            sendResponse({
+              type: 'PAGE_QUIET',
+              settled: quiet.settled,
+              identity: observe().identity,
+            } satisfies ContentToBackground);
+            return;
+          }
+          case 'EXECUTE_RECIPE_ACTION': {
+            const result = await executeRecipeAction(msg.step);
+            sendResponse({
+              type: 'RECIPE_ACTION_RESULT',
+              ...result,
+            } satisfies ContentToBackground);
             return;
           }
         }

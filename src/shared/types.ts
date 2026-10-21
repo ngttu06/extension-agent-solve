@@ -2,9 +2,43 @@
 // Shared domain types used across background, content script and side panel.
 // ---------------------------------------------------------------------------
 
+export interface SemanticLocator {
+  version: 1;
+  tag: string;
+  role?: string;
+  accessibleName?: string;
+  attributes: {
+    id?: string;
+    name?: string;
+    type?: string;
+    autocomplete?: string;
+    placeholder?: string;
+    href?: string;
+    testId?: string;
+  };
+  ancestors?: Array<{
+    tag: string;
+    role?: string;
+    accessibleName?: string;
+    id?: string;
+  }>;
+  ordinalHint?: number;
+}
+
+export interface PageIdentity {
+  /** New for every document load; stable for the lifetime of one content script. */
+  documentId: string;
+  /** Increments whenever page content, form state, route, or viewport changes. */
+  revision: number;
+  canonicalUrl: string;
+  routeKey: string;
+  structureHash: string;
+  landmarkHashes: string[];
+}
+
 /** A single interactive element discovered on the page, referenced by index. */
 export interface PageElement {
-  /** Stable index the agent uses to reference this element in tool calls. */
+  /** Index valid only for the snapshot that produced it. */
   index: number;
   /** Tag name, lowercased (e.g. "button", "a", "input"). */
   tag: string;
@@ -18,6 +52,8 @@ export interface PageElement {
   rect: { x: number; y: number; width: number; height: number };
   /** Whether the element is currently visible in the viewport. */
   inViewport: boolean;
+  /** Durable semantic description used to re-resolve this target later. */
+  locator: SemanticLocator;
 }
 
 /** A snapshot of the page produced by the perception layer. */
@@ -30,6 +66,7 @@ export interface PageSnapshot {
   elements: PageElement[];
   /** Set when DOM perception was insufficient and vision is advised. */
   needsVision?: boolean;
+  identity: PageIdentity;
   capturedAt: number;
 }
 
@@ -103,11 +140,21 @@ export interface ProviderConfig {
 
 export type ExecutionMode = 'auto' | 'confirm';
 
+export interface ActionCacheSettings {
+  enabled: boolean;
+  ttlDays: number;
+  maxRecipes: number;
+  maxBytes: number;
+}
+
 export interface Settings {
   provider: ProviderConfig;
   mode: ExecutionMode;
   /** Max agent loop iterations before forcing a stop. */
   maxSteps: number;
+  showVirtualCursor: boolean;
+  showProcessingEffects: boolean;
+  actionCache: ActionCacheSettings;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -122,6 +169,14 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   mode: 'confirm',
   maxSteps: 25,
+  showVirtualCursor: true,
+  showProcessingEffects: true,
+  actionCache: {
+    enabled: true,
+    ttlDays: 14,
+    maxRecipes: 50,
+    maxBytes: 512_000,
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -152,6 +207,96 @@ export interface AgentStep {
   toolCall?: ToolCall;
   toolResult?: ToolResult;
   timestamp: number;
+  metadata?: {
+    source?: 'model' | 'recipe' | 'system';
+    durationMs?: number;
+    cacheStatus?: 'lookup' | 'hit' | 'miss' | 'replaying' | 'diverged' | 'verified';
+  };
+}
+
+export type RecipeToolName = 'click' | 'type' | 'select' | 'navigate';
+
+export interface TargetState {
+  visible: boolean;
+  enabled: boolean;
+  editable?: boolean;
+  valueHash?: string;
+  selectedValue?: string;
+  checked?: boolean;
+  pressed?: boolean;
+  expanded?: boolean;
+}
+
+export interface RecipePrecondition {
+  canonicalUrl: string;
+  routeKey: string;
+  minimumLandmarkSimilarity: number;
+  expectedLandmarkHashes: string[];
+  requiredLandmarkHashes?: string[];
+  expectedTargetState?: TargetState;
+}
+
+export type RecipePostcondition =
+  | { kind: 'url'; canonicalUrl: string }
+  | { kind: 'document-changed' }
+  | { kind: 'target-state'; state: TargetState }
+  | { kind: 'landmarks-added'; hashes: string[] }
+  | { kind: 'landmarks-removed'; hashes: string[] };
+
+export interface RecipeStep {
+  id: string;
+  tool: RecipeToolName;
+  locator?: SemanticLocator;
+  args: Record<string, unknown>;
+  precondition: RecipePrecondition;
+  postconditions: RecipePostcondition[];
+}
+
+export interface ActionRecipe {
+  schemaVersion: 1;
+  id: string;
+  key: string;
+  goalHash: string;
+  entryIdentity: Omit<PageIdentity, 'documentId' | 'revision'>;
+  steps: RecipeStep[];
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt: number;
+  expiresAt: number;
+  useCount: number;
+  successCount: number;
+  divergenceCount: number;
+  quarantined: boolean;
+  byteSize: number;
+}
+
+export interface ActionExecutionEvidence {
+  documentIdBefore: string;
+  documentIdAfter: string;
+  revisionBefore: number;
+  revisionAfter: number;
+  urlBefore: string;
+  urlAfter: string;
+  resolvedLocator?: SemanticLocator;
+  locatorScore?: number;
+  targetStateBefore?: TargetState;
+  targetStateAfter?: TargetState;
+  identityAfter: PageIdentity;
+  settled: boolean;
+  sensitive: boolean;
+  durationMs: number;
+}
+
+export interface ActionCacheStats {
+  recipeCount: number;
+  byteSize: number;
+  hits: number;
+  misses: number;
+  successfulReplays: number;
+  divergences: number;
+  replayedSteps: number;
+  avoidedModelTurns: number;
+  totalReplayMs: number;
 }
 
 // ---------------------------------------------------------------------------
