@@ -1,6 +1,6 @@
 {
   "name": "extension-agent-solve",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browser agent extension that perceives, reasons and acts on web pages using configurable AI providers.",
   "type": "module",
   "scripts": {
@@ -30,6 +30,7 @@
     "typescript": "^5.5.4",
     "vite": "^5.4.3",
     "vitest": "^2.1.9",
-    "jsdom": "^25.0.1"
+    "jsdom": "^25.0.1",
+    "@types/jsdom": "^21.1.7"
   }
 }
