@@ -118,6 +118,9 @@ async function startTask(goal: string, tabId: number): Promise<void> {
       send({ type: 'MESSAGE', message });
       persistSoon();
     },
+    onStatus: (status) => {
+      send({ type: 'STATUS', status });
+    },
     requestConfirm: (toolCall: ToolCall, description: string) =>
       new Promise<boolean>((resolve) => {
         pendingConfirm = { toolCallId: toolCall.id, resolve };

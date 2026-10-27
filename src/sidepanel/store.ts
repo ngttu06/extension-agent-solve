@@ -5,6 +5,7 @@ import {
   type ActionCacheStats,
   type AgentStep,
   type ChatMessage,
+  type RunStatus,
   type SessionSummary,
   type Settings,
   type ToolCall,
@@ -35,6 +36,7 @@ interface PanelState {
   running: boolean;
   steps: AgentStep[];
   messages: ChatMessage[];
+  runStatus: RunStatus | null;
   settings: Settings;
   actionCacheStats: ActionCacheStats;
   sessions: SessionSummary[];
@@ -85,6 +87,7 @@ export const usePanelStore = create<PanelState>((set, get) => ({
   running: false,
   steps: [],
   messages: [],
+  runStatus: null,
   settings: DEFAULT_SETTINGS,
   actionCacheStats: EMPTY_CACHE_STATS,
   sessions: [],
@@ -122,6 +125,9 @@ export const usePanelStore = create<PanelState>((set, get) => ({
         case 'MESSAGE':
           set((s) => ({ messages: [...s.messages, msg.message] }));
           break;
+        case 'STATUS':
+          set({ runStatus: msg.status });
+          break;
         case 'CONFIRM_REQUEST':
           set({ confirmRequest: { toolCall: msg.toolCall, description: msg.description } });
           break;
@@ -135,10 +141,10 @@ export const usePanelStore = create<PanelState>((set, get) => ({
           set({ actionCacheStats: msg.stats });
           break;
         case 'DONE':
-          set({ running: false });
+          set({ running: false, runStatus: null });
           break;
         case 'ERROR':
-          set({ running: false, error: msg.message });
+          set({ running: false, error: msg.message, runStatus: null });
           break;
       }
     });

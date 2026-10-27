@@ -6,6 +6,7 @@ import type {
   PageIdentity,
   PageSnapshot,
   RecipeStep,
+  RunStatus,
   Session,
   SessionSummary,
   Settings,
@@ -40,6 +41,7 @@ export type BackgroundToPanel =
   | { type: 'STEP'; step: AgentStep }
   | { type: 'MESSAGE'; message: ChatMessage }
   | { type: 'STATE'; running: boolean; steps: AgentStep[]; messages: ChatMessage[] }
+  | { type: 'STATUS'; status: RunStatus }
   | { type: 'CONFIRM_REQUEST'; toolCall: ToolCall; description: string }
   | { type: 'ASK_USER'; question: string }
   | { type: 'SETTINGS'; settings: Settings }

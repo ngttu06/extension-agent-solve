@@ -1,13 +1,16 @@
 import type { BackgroundToContent, ContentToBackground } from '@/shared/messages';
 import { TOOL_SCHEMAS } from '@/shared/tools';
+import { createToolRegistry } from '@/background/tools';
+import { createToolContext } from '@/background/tools/context';
+import { neverRetryToolNames, parallelToolNames, riskyToolNames } from '@/shared/tool-registry';
 import {
-  RISKY_TOOLS,
   type ActionExecutionEvidence,
   type ActionRecipe,
   type AgentStep,
   type ChatMessage,
   type PageSnapshot,
   type RecipeStep,
+  type RunStatus,
   type Settings,
   type ToolCall,
   type ToolResult,
@@ -15,6 +18,7 @@ import {
 import { createProvider, isRetryableProviderError } from './providers';
 import { renderSnapshot, SYSTEM_PROMPT } from './prompt';
 import { DEFAULT_RETRIES, withRetry } from '@/shared/retry';
+import { StatusPublisher } from './status';
 import {
   RecipeEngine,
   summarizeExecutedRecipe,
@@ -26,6 +30,12 @@ import {
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+// Create registry once at module level
+const TOOL_REGISTRY = createToolRegistry();
+const RISKY_TOOL_NAMES = riskyToolNames(TOOL_REGISTRY);
+const NEVER_RETRY_TOOL_NAMES = neverRetryToolNames(TOOL_REGISTRY);
+const PARALLEL_TOOL_NAMES = parallelToolNames(TOOL_REGISTRY);
 
 /**
  * Whether a failed ToolResult looks like a transport error (the action likely
@@ -42,25 +52,6 @@ function isTransientToolFailure(content: string): boolean {
   );
 }
 
-/** Side-effect tools may have completed before their response was lost. Never replay them. */
-const NEVER_RETRY_TOOLS: ToolCall['name'][] = [
-  'click',
-  'type',
-  'select',
-  'scroll',
-  'navigate',
-  'go_back',
-  'edit_html',
-  'execute_javascript',
-];
-
-const PARALLEL_READ_ONLY_TOOLS = new Set<ToolCall['name']>([
-  'observe_page',
-  'inspect_html',
-  'extract',
-  'screenshot',
-]);
-
 function preview(value: unknown, maxLength = 180): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
@@ -69,6 +60,7 @@ function preview(value: unknown, maxLength = 180): string {
 export interface OrchestratorHooks {
   onStep: (step: AgentStep) => void;
   onMessage: (message: ChatMessage) => void;
+  onStatus: (status: RunStatus) => void;
   /** Request user confirmation for a risky tool. Resolves to approved/denied. */
   requestConfirm: (toolCall: ToolCall, description: string) => Promise<boolean>;
   /** Ask the user a question and await their typed answer. */
@@ -111,6 +103,7 @@ export class Orchestrator {
   private recipeEngine: RecipeEngine;
   private goal = '';
   private pendingReplayVerification: { recipeId: string; steps: number; durationMs: number } | null = null;
+  private statusPublisher: StatusPublisher;
 
   constructor(
     private settings: Settings,
@@ -120,11 +113,13 @@ export class Orchestrator {
     private hooks: OrchestratorHooks,
   ) {
     this.recipeEngine = new RecipeEngine(settings);
+    this.statusPublisher = new StatusPublisher((status) => hooks.onStatus(status));
   }
 
   stop(): void {
     this.stopped = true;
     this.abort.abort();
+    this.statusPublisher.reset();
     void this.setGlow(false);
   }
 
@@ -146,10 +141,14 @@ export class Orchestrator {
   async run(goal: string): Promise<void> {
     if (!this.settings.provider.apiKey) {
       this.hooks.onError('No API key configured. Open settings and add your provider key.');
+      this.statusPublisher.updatePhase('error', { detail: 'No API key' });
       return;
     }
 
     this.goal = goal;
+    this.statusPublisher.setMaxIterations(this.settings.maxSteps);
+    this.statusPublisher.updatePhase('preparing', { detail: goal });
+
     const provider = createProvider(this.settings.provider);
     this.messages = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -191,6 +190,9 @@ export class Orchestrator {
         this.messages.push({ role: 'user', content: `Current page snapshot:\n${renderSnapshot(initial)}` });
       }
       await this.loop(provider);
+    } catch (err) {
+      this.statusPublisher.updatePhase('error', { detail: errMessage(err) });
+      throw err;
     } finally {
       await this.setGlow(false);
     }
@@ -201,7 +203,9 @@ export class Orchestrator {
     for (let iter = 0; iter < this.settings.maxSteps; iter += 1) {
       if (this.stopped) return;
 
+      this.statusPublisher.updatePhase('calling-model', { iteration: iter + 1 });
       let response;
+      const callStart = Date.now();
       try {
         response = await withRetry(
           () => provider.chat(this.messages, TOOL_SCHEMAS, this.abort.signal),
@@ -220,12 +224,15 @@ export class Orchestrator {
         );
       } catch (err) {
         if (this.stopped) return;
+        this.statusPublisher.updatePhase('error', { detail: errMessage(err) });
         this.hooks.onError(`Model call failed: ${errMessage(err)}`);
         return;
       }
+      this.statusPublisher.setLastDuration(Date.now() - callStart);
 
       // No tool calls → the model is done and this text is its final answer.
       if (response.toolCalls.length === 0) {
+        this.statusPublisher.updatePhase('finishing', { detail: 'Model completed task' });
         this.messages.push({ role: 'assistant', content: response.text });
         if (response.text) {
           this.hooks.onStep(step({ kind: 'final', title: 'Answer', detail: response.text }));
@@ -234,11 +241,13 @@ export class Orchestrator {
         } else {
           this.hooks.onError('Model returned no action and no message.');
         }
+        this.statusPublisher.updatePhase('done');
         return;
       }
 
       // Otherwise this text is intermediate reasoning ahead of tool calls.
       if (response.text) {
+        this.statusPublisher.updatePhase('thinking', { detail: response.text.slice(0, 100) });
         this.hooks.onStep(step({ kind: 'thought', title: 'Thinking', detail: response.text }));
         this.hooks.onMessage({ role: 'assistant', content: response.text });
       }
@@ -252,11 +261,11 @@ export class Orchestrator {
       for (let index = 0; index < response.toolCalls.length;) {
         if (this.stopped) return;
         const call = response.toolCalls[index];
-        if (PARALLEL_READ_ONLY_TOOLS.has(call.name)) {
+        if (PARALLEL_TOOL_NAMES.has(call.name)) {
           const batch: ToolCall[] = [];
           while (
             index < response.toolCalls.length &&
-            PARALLEL_READ_ONLY_TOOLS.has(response.toolCalls[index].name)
+            PARALLEL_TOOL_NAMES.has(response.toolCalls[index].name)
           ) {
             batch.push(response.toolCalls[index]);
             index += 1;
@@ -270,6 +279,7 @@ export class Orchestrator {
         index += 1;
 
         if (call.name === 'finish') {
+          this.statusPublisher.updatePhase('finishing', { detail: String(call.args.summary ?? 'Task complete.') });
           const summary = String(call.args.summary ?? 'Task complete.');
           if (this.pendingReplayVerification) {
             const verification = this.pendingReplayVerification;
@@ -284,10 +294,12 @@ export class Orchestrator {
           }
           this.hooks.onStep(step({ kind: 'final', title: 'Finished', detail: summary }));
           this.hooks.onDone(summary);
+          this.statusPublisher.updatePhase('done');
           return;
         }
 
         if (call.name === 'ask_user') {
+          this.statusPublisher.updatePhase('awaiting-user', { detail: String(call.args.question ?? 'Waiting for user input') });
           this.pendingReplayVerification = null;
           this.recipeEngine.disqualify();
           const question = String(call.args.question ?? 'Could you clarify?');
@@ -302,7 +314,8 @@ export class Orchestrator {
           continue;
         }
 
-        if (this.settings.mode === 'confirm' && RISKY_TOOLS.includes(call.name)) {
+        if (this.settings.mode === 'confirm' && RISKY_TOOL_NAMES.has(call.name)) {
+          this.statusPublisher.updatePhase('awaiting-confirm', { activeTool: call.name, detail: this.describeCall(call) });
           const description = this.describeCall(call);
           const approved = await this.hooks.requestConfirm(call, description);
           if (!approved) {
@@ -316,6 +329,8 @@ export class Orchestrator {
             continue;
           }
         }
+
+        this.statusPublisher.updatePhase('running-tool', { activeTool: call.name, detail: this.describeCall(call) });
 
         if (this.pendingReplayVerification) this.pendingReplayVerification = null;
         const before = this.lastSnapshot ?? await this.observe(true);
@@ -336,6 +351,7 @@ export class Orchestrator {
     recipe: ActionRecipe,
     initial: PageSnapshot,
   ): Promise<{ snapshot: PageSnapshot | null; report: string }> {
+    this.statusPublisher.updatePhase('replaying-recipe', { detail: `Replaying ${recipe.steps.length} cached steps` });
     const started = performance.now();
     const executed: RecipeStep[] = [];
     let current = initial;
@@ -360,7 +376,7 @@ export class Orchestrator {
           target: recipeStep.locator?.accessibleName ?? recipeStep.locator?.tag,
         },
       };
-      if (this.settings.mode === 'confirm' && RISKY_TOOLS.includes(syntheticCall.name)) {
+      if (this.settings.mode === 'confirm' && RISKY_TOOL_NAMES.has(syntheticCall.name)) {
         const approved = await this.hooks.requestConfirm(
           syntheticCall,
           `Replay cached step ${index + 1}/${recipe.steps.length}: ${this.describeRecipeStep(recipeStep)}`,
@@ -534,7 +550,7 @@ export class Orchestrator {
    */
   private async withToolRetry(call: ToolCall): Promise<ToolResult> {
     let result = await this.executeTool(call);
-    if (NEVER_RETRY_TOOLS.includes(call.name)) return result;
+    if (NEVER_RETRY_TOOL_NAMES.has(call.name)) return result;
     for (let attempt = 1; attempt <= DEFAULT_RETRIES; attempt += 1) {
       if (result.ok || this.stopped || !isTransientToolFailure(result.content)) return result;
 
@@ -555,7 +571,33 @@ export class Orchestrator {
 
   private async executeTool(call: ToolCall): Promise<ToolResult> {
     this.lastExecutionEvidence = undefined;
+    
     try {
+      const toolDef = TOOL_REGISTRY.get(call.name);
+      if (!toolDef) {
+        return {
+          id: call.id,
+          name: call.name,
+          ok: false,
+          content: `Unknown tool: ${call.name}`,
+        };
+      }
+
+      // Create context for this execution
+      const context = createToolContext(
+        this.tabId,
+        this.settings,
+        this.hooks,
+        {
+          observe: (force) => this.observe(force),
+          navigateAndWait: (url) => this.navigateAndWait(url),
+          goBackAndWait: () => this.goBackAndWait(),
+          captureScreenshot: () => this.captureScreenshot(),
+          executeJavaScript: (call) => this.executeJavaScript(call),
+        },
+      );
+
+      // Special handling for tools that need orchestrator state
       switch (call.name) {
         case 'observe_page': {
           const snapshot = await this.observe();
@@ -597,98 +639,14 @@ export class Orchestrator {
         }
         case 'execute_javascript':
           return this.executeJavaScript(call);
-        case 'wait': {
-          const ms = Math.min(Number(call.args.ms) || 500, 10000);
-          await new Promise((r) => setTimeout(r, ms));
-          return { id: call.id, name: call.name, ok: true, content: `Waited ${ms}ms.` };
-        }
-        case 'click':
-        case 'type':
-        case 'select':
-        case 'scroll':
-        case 'extract':
-        case 'inspect_html':
-        case 'edit_html': {
-          const result = await this.sendToContent(call);
-          return { ...result, id: call.id };
-        }
         default:
-          return {
-            id: call.id,
-            name: call.name,
-            ok: false,
-            content: `Unknown tool: ${call.name}`,
-          };
+          // Use registry executor for all other tools
+          return await toolDef.execute(call, context);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { id: call.id, name: call.name, ok: false, content: `Tool error: ${message}` };
     }
-  }
-
-  private async sendToContent(call: ToolCall): Promise<ToolResult> {
-    await this.ensureContentScript();
-    let cmd: BackgroundToContent;
-    switch (call.name) {
-      case 'click':
-        cmd = { type: 'CLICK', index: Number(call.args.index) };
-        break;
-      case 'inspect_html':
-        cmd = {
-          type: 'INSPECT_HTML',
-          selector: String(call.args.selector ?? ''),
-          outer: call.args.outer === undefined ? true : Boolean(call.args.outer),
-          maxLength: Number(call.args.max_length) || 8000,
-        };
-        break;
-      case 'edit_html':
-        cmd = {
-          type: 'EDIT_HTML',
-          selector: String(call.args.selector ?? ''),
-          mode: call.args.mode as
-            | 'inner'
-            | 'outer'
-            | 'append'
-            | 'prepend'
-            | 'before'
-            | 'after'
-            | 'remove',
-          html: String(call.args.html ?? ''),
-          all: Boolean(call.args.all),
-        };
-        break;
-      case 'type':
-        cmd = {
-          type: 'TYPE',
-          index: Number(call.args.index),
-          text: String(call.args.text ?? ''),
-          submit: Boolean(call.args.submit),
-        };
-        break;
-      case 'select':
-        cmd = {
-          type: 'SELECT',
-          index: Number(call.args.index),
-          value: String(call.args.value ?? ''),
-        };
-        break;
-      case 'scroll':
-        cmd = { type: 'SCROLL', direction: (call.args.direction as 'down') ?? 'down' };
-        break;
-      case 'extract':
-        cmd = { type: 'EXTRACT', query: String(call.args.query ?? '') };
-        break;
-      default:
-        return { id: call.id, name: call.name, ok: false, content: 'Unsupported content command.' };
-    }
-
-    const res = (await chrome.tabs.sendMessage(this.tabId, cmd)) as ContentToBackground;
-    if (res?.type === 'ACTION_RESULT') {
-      this.lastExecutionEvidence = res.evidence;
-      if (!['inspect_html', 'extract'].includes(call.name)) this.lastSnapshot = null;
-      return res.result;
-    }
-    return { id: call.id, name: call.name, ok: false, content: 'No response from content script.' };
   }
 
   /**

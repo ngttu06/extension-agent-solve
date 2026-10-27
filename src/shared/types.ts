@@ -89,7 +89,9 @@ export type ToolName =
   | 'screenshot'
   | 'wait'
   | 'ask_user'
-  | 'finish';
+  | 'finish'
+  | 'web_search'
+  | 'fetch_url';
 
 export interface ToolCall {
   /** Provider-assigned id, used to correlate results back to the model. */
@@ -119,6 +121,76 @@ export const RISKY_TOOLS: ToolName[] = [
   'edit_html',
   'execute_javascript',
 ];
+
+/**
+ * Derive risky tool names from the registry at runtime.
+ * This is the new source of truth; RISKY_TOOLS above is kept for back-compat.
+ */
+export function getRiskyTools(): Set<ToolName> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { createToolRegistry } = require('@/background/tools');
+  const { riskyToolNames } = require('@/shared/tool-registry');
+  return riskyToolNames(createToolRegistry());
+}
+
+// ---------------------------------------------------------------------------
+// Agent status tracking.
+// ---------------------------------------------------------------------------
+
+/**
+ * Agent execution phase — what is the agent doing right now.
+ */
+export type AgentPhase =
+  | 'idle'
+  | 'preparing'
+  | 'thinking'
+  | 'calling-model'
+  | 'running-tool'
+  | 'awaiting-confirm'
+  | 'awaiting-user'
+  | 'replaying-recipe'
+  | 'finishing'
+  | 'done'
+  | 'error';
+
+/**
+ * Live status of an agent run — published at phase boundaries.
+ */
+export interface RunStatus {
+  phase: AgentPhase;
+  /** Human-readable detail (e.g. "web_search: giá vàng hôm nay"). */
+  detail?: string;
+  /** Current iteration in the agent loop. */
+  iteration?: number;
+  /** Max iterations before stopping. */
+  maxIterations?: number;
+  /** The tool currently being executed (if phase === 'running-tool'). */
+  activeTool?: ToolName;
+  /** Timestamp when this run started (epoch ms). */
+  startedAt: number;
+  /** Elapsed time since start (ms). */
+  elapsedMs: number;
+  /** Duration of the last step (ms). */
+  lastDurationMs?: number;
+  /** Token and turn accounting. */
+  usage?: {
+    modelTurns: number;
+    inputTokens?: number;
+    outputTokens?: number;
+  };
+  /** Current plan items (if using update_plan tool). */
+  plan?: PlanItem[];
+}
+
+/**
+ * A single item in an agent plan.
+ */
+export interface PlanItem {
+  id: string;
+  text: string;
+  status: 'pending' | 'in_progress' | 'done' | 'skipped';
+}
+
 
 // ---------------------------------------------------------------------------
 // Provider configuration.

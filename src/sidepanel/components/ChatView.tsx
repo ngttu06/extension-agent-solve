@@ -207,11 +207,36 @@ function FinalAnswer({ step }: { step: AgentStep }) {
 function StatusIndicator({ showProcessingEffects }: { showProcessingEffects: boolean }) {
   const running = usePanelStore((s) => s.running);
   const steps = usePanelStore((s) => s.steps);
+  const runStatus = usePanelStore((s) => s.runStatus);
   if (!running) return null;
   const last = steps[steps.length - 1];
   // A live group is already showing the animation for any non-final tail step.
   if (last && last.kind !== 'final') return null;
-  const label = 'Thinking';
+  
+  let label = 'Thinking';
+  if (runStatus) {
+    switch (runStatus.phase) {
+      case 'replaying-recipe':
+        label = 'Replaying recipe';
+        break;
+      case 'calling-model':
+        label = 'Calling model';
+        break;
+      case 'running-tool':
+        label = runStatus.activeTool ? `Executing ${runStatus.activeTool}` : 'Executing tool';
+        break;
+      case 'preparing':
+        label = 'Preparing';
+        break;
+      case 'finishing':
+        label = 'Finishing';
+        break;
+      case 'thinking':
+      default:
+        label = 'Thinking';
+    }
+  }
+  
   return (
     <div className="glass flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium shadow-glassSm animate-fade-slide">
       <span className={showProcessingEffects ? 'shimmer-text' : 'text-content'}>{label}</span>

@@ -24,6 +24,8 @@ Content Script                   ← DOM perception + action executor + highligh
 - `src/content` — perception and action execution in the page.
 - `src/sidepanel` — React UI and state store.
 
+See [Tool Architecture](docs/TOOL_ARCHITECTURE.md) for details on the tool registry system.
+
 ## Providers
 
 Configure any provider in Settings:
